@@ -4,9 +4,11 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
 #define MAX_TOKENS 256
 #define MAX_PATH_DIRS 128
+#define MAX_CHILDREN 128
 
 static char *path_dirs[MAX_PATH_DIRS];
 static int npath = 0;
@@ -19,19 +21,76 @@ static void error(void)
 
 static void set_default_path(void)
 {
+    for (int i = 0; i < npath; i++) {
+        free(path_dirs[i]);
+    }
     npath = 0;
     path_dirs[npath++] = strdup("/bin");
 }
 
-// розбивається рядок на токени за пробілами/табами і повертається кількість токенів
-static int tokenize(char *line, char *tokens[])
+/* вставляє пробіли навколо кожного символу c, щоб операції >, &
+ * розпізнавались як окремі токени, навіть якщо написані без пробілів
+ * навколо і викликач звільняє пам'ять. */
+static char *spacer(const char *s, char c)
+{
+    size_t len = strlen(s);
+    char *out = malloc(len * 3 + 1);
+    if (!out) {
+        error();
+        exit(1);
+    }
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == c) {
+            out[j++] = ' ';
+            out[j++] = c;
+            out[j++] = ' ';
+        } else {
+            out[j++] = s[i];
+        }
+    }
+    out[j] = '\0';
+    return out;
+}
+
+// прибирає пробіли/таби/переноси рядків на початку й у кінці рядка
+static char *trim(char *s)
+{
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
+        s++;
+    if (*s == '\0')
+        return s;
+    char *end = s + strlen(s) - 1;
+    while (end > s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) {
+        *end = '\0';
+        end--;
+    }
+    return s;
+}
+
+// розбивається рядок на сегменти за символом & (паралельні команди)
+static int split_ampersand(char *line, char *segments[])
+{
+    char *spaced = spacer(line, '&');
+    int n = 0;
+    char *saveptr;
+    char *tok = strtok_r(spaced, "&", &saveptr);
+    while (tok != NULL && n < MAX_CHILDREN) {
+        segments[n++] = tok;
+        tok = strtok_r(NULL, "&", &saveptr);
+    }
+    return n;
+}
+
+// розбивається один сегмент команди на токени за пробілами
+static int tokenize(char *seg, char *tokens[])
 {
     int n = 0;
     char *saveptr;
-    char *tok = strtok_r(line, " \t\r\n", &saveptr);
+    char *tok = strtok_r(seg, " \t", &saveptr);
     while (tok != NULL && n < MAX_TOKENS) {
         tokens[n++] = tok;
-        tok = strtok_r(NULL, " \t\r\n", &saveptr);
+        tok = strtok_r(NULL, " \t", &saveptr);
     }
     return n;
 }
@@ -49,83 +108,162 @@ static char *find_executable(const char *cmd)
     return NULL;
 }
 
-// повертає 1, якщо команда була вбудованою, інакше 0
-static int run_builtin(char *tokens[], int ntok)
+/* виконує один сегмент (уже розділений по &), повертає pid дочірнього
+ * процесу, якщо його треба чекати або -1, якщо чекати нічого не треба */
+static pid_t run_segment(char *seg)
 {
-    if (strcmp(tokens[0], "exit") == 0) {
-        if (ntok != 1) {
+    char *trimmed = trim(seg);
+    if (*trimmed == '\0') {
+        return -1; // порожній сегмент пропускаєи
+    }
+
+    // робимо > окремим токеном, відділеним пробілами
+    char *spaced = spacer(trimmed, '>');
+
+    char *tokens[MAX_TOKENS];
+    int ntok = tokenize(spaced, tokens);
+
+    if (ntok == 0) {
+        free(spaced);
+        return -1;
+    }
+
+    // шукаєм символи перенаправлення серед токенів
+    int gt_count = 0;
+    int gt_index = -1;
+    for (int i = 0; i < ntok; i++) {
+        if (strcmp(tokens[i], ">") == 0) {
+            gt_count++;
+            gt_index = i;
+        }
+    }
+
+    char *redir_file = NULL;
+    int cmd_ntok = ntok;
+
+    if (gt_count > 1) {
+        error();
+        free(spaced);
+        return -1;
+    } else if (gt_count == 1) {
+        // перед > має бути хоча б один токен, після рівно один
+        int after = ntok - gt_index - 1;
+        if (gt_index == 0 || after != 1) {
             error();
-            return 1;
+            free(spaced);
+            return -1;
+        }
+        redir_file = tokens[gt_index + 1];
+        cmd_ntok = gt_index;
+    }
+
+    // формується NULL-термінований argv для частини команди, без > і файлу
+    char *argv[MAX_TOKENS + 1];
+    for (int i = 0; i < cmd_ntok; i++) {
+        argv[i] = tokens[i];
+    }
+    argv[cmd_ntok] = NULL;
+
+    if (cmd_ntok == 0) {
+        error();
+        free(spaced);
+        return -1;
+    }
+
+    // вбудовані команди виконуються синхронно в батьківському процесі,
+    // без fork інакше зміна директорії чи шляху не вплинула б на сам шелл
+    if (strcmp(argv[0], "exit") == 0) {
+        if (cmd_ntok != 1) {
+            error();
+            free(spaced);
+            return -1;
         }
         exit(0);
-    }
-
-    if (strcmp(tokens[0], "cd") == 0) {
-        if (ntok != 2) {
+    } else if (strcmp(argv[0], "cd") == 0) {
+        if (cmd_ntok != 2) {
             error();
-        } else if (chdir(tokens[1]) != 0) {
+        } else if (chdir(argv[1]) != 0) {
             error();
         }
-        return 1;
-    }
-
-    if (strcmp(tokens[0], "path") == 0) {
-        // команда path завжди перезаписує старий шлях новим
+        free(spaced);
+        return -1;
+    } else if (strcmp(argv[0], "path") == 0) {
         for (int i = 0; i < npath; i++) {
             free(path_dirs[i]);
         }
         npath = 0;
-        for (int i = 1; i < ntok && npath < MAX_PATH_DIRS; i++) {
-            path_dirs[npath++] = strdup(tokens[i]);
+        for (int i = 1; i < cmd_ntok && npath < MAX_PATH_DIRS; i++) {
+            path_dirs[npath++] = strdup(argv[i]);
         }
-        return 1;
+        free(spaced);
+        return -1;
     }
 
-    return 0;
-}
-
-static void run_command(char *tokens[], int ntok)
-{
-    if (ntok == 0) {
-        return;
-    }
-
-    if (run_builtin(tokens, ntok)) {
-        return;
-    }
-
-    char *exe = find_executable(tokens[0]);
+    // зовнішня команда fork + exec
+    char *exe = find_executable(argv[0]);
     if (exe == NULL) {
         error();
-        return;
+        free(spaced);
+        return -1;
     }
-    // копіюєтьсч шлях, бо find_executable повертає вказівник на статичний буфер, який може бути перезаписаний наступним викликом
+    // копіюєм шлях, бо find_executable повертає вказівник на
+    // статичний буфер, який може бути перезаписаний наступним викликом
     char exe_copy[4096];
     strncpy(exe_copy, exe, sizeof(exe_copy) - 1);
     exe_copy[sizeof(exe_copy) - 1] = '\0';
 
-    char *argv[MAX_TOKENS + 1];
-    for (int i = 0; i < ntok; i++) {
-        argv[i] = tokens[i];
-    }
-    argv[ntok] = NULL;
-
     pid_t pid = fork();
     if (pid < 0) {
         error();
-        return;
+        free(spaced);
+        return -1;
     }
     if (pid == 0) {
-        // дочірній процес виконує програму
+        // дочірній процес
+        if (redir_file != NULL) {
+            int fd = open(redir_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) {
+                error();
+                exit(1);
+            }
+            if (dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0) {
+                error();
+                exit(1);
+            }
+            close(fd);
+        }
         execv(exe_copy, argv);
-        // execv повертає керування лише у разі помилки
+        // execv повертає керування лише у разі помилки 
         error();
         exit(1);
     }
 
-    // Батьківський процес чекає завершення дочірнього
-    int status;
-    waitpid(pid, &status, 0);
+    // батьківський процес спершу запускає всі сегменти, чекаєм пізніше
+    free(spaced);
+    return pid;
+}
+
+static void process_line(char *line)
+{
+    char *segments[MAX_CHILDREN];
+    int nseg = split_ampersand(line, segments);
+
+    pid_t children[MAX_CHILDREN];
+    int nchildren = 0;
+
+    // спочатку запуск всіх команд сегмента, паралельно, без очікування
+    for (int i = 0; i < nseg; i++) {
+        pid_t pid = run_segment(segments[i]);
+        if (pid > 0 && nchildren < MAX_CHILDREN) {
+            children[nchildren++] = pid;
+        }
+    }
+
+    // тепер чекаєм завершення всіх запущених процесів
+    for (int i = 0; i < nchildren; i++) {
+        int status;
+        waitpid(children[i], &status, 0);
+    }
 }
 
 int main(int argc, char *argv[])
@@ -165,10 +303,12 @@ int main(int argc, char *argv[])
             exit(0);
         }
 
-        char *tokens[MAX_TOKENS];
-        int ntok = tokenize(line, tokens);
-        run_command(tokens, ntok);
+        process_line(line);
     }
 
+    free(line);
+    if (!interactive) {
+        fclose(input);
+    }
     return 0;
 }
